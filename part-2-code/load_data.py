@@ -17,60 +17,159 @@ class T5Dataset(Dataset):
 
     def __init__(self, data_folder, split):
         '''
-        Skeleton for the class for performing data processing for the T5 model.
+        Initialize T5Dataset for text-to-SQL task.
 
-        Some tips for implementation:
-            * You should be using the 'google-t5/t5-small' tokenizer checkpoint to tokenize both
-              the encoder and decoder output. 
-            * You want to provide the decoder some beginning of sentence token. Any extra-id on the
-              T5Tokenizer should serve that purpose.
-            * Class behavior should be different on the test set.
+        Args:
+            data_folder: Path to the data directory
+            split: One of 'train', 'dev', or 'test'
         '''
-        # TODO
+        self.split = split
+        self.tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+
+        # Load and process data
+        self.encoder_inputs, self.decoder_targets, self.nl_queries = self.process_data(
+            data_folder, split, self.tokenizer
+        )
+
+        # Decoder BOS token - use extra_id_0 as suggested
+        self.decoder_bos_token_id = self.tokenizer.convert_tokens_to_ids('<extra_id_0>')
 
     def process_data(self, data_folder, split, tokenizer):
-        # TODO
-    
+        '''
+        Load and tokenize the data.
+
+        Returns:
+            encoder_inputs: List of tokenized natural language queries
+            decoder_targets: List of tokenized SQL queries (None for test set)
+            nl_queries: List of original natural language queries
+        '''
+        # Load natural language queries
+        nl_path = os.path.join(data_folder, f'{split}.nl')
+        with open(nl_path, 'r') as f:
+            nl_queries = [line.strip() for line in f.readlines()]
+
+        # Tokenize encoder inputs (natural language)
+        encoder_inputs = []
+        for query in nl_queries:
+            # T5 expects prefix for task - using "translate English to SQL: " prefix
+            prefixed_query = f"translate English to SQL: {query}"
+            tokenized = tokenizer(prefixed_query, add_special_tokens=True, return_tensors='pt')
+            encoder_inputs.append(tokenized['input_ids'].squeeze(0))
+
+        # Load and tokenize SQL queries (if not test set)
+        decoder_targets = None
+        if split != 'test':
+            sql_path = os.path.join(data_folder, f'{split}.sql')
+            with open(sql_path, 'r') as f:
+                sql_queries = [line.strip() for line in f.readlines()]
+
+            decoder_targets = []
+            for sql in sql_queries:
+                tokenized = tokenizer(sql, add_special_tokens=True, return_tensors='pt')
+                decoder_targets.append(tokenized['input_ids'].squeeze(0))
+
+        return encoder_inputs, decoder_targets, nl_queries
+
     def __len__(self):
-        # TODO
+        return len(self.encoder_inputs)
 
     def __getitem__(self, idx):
-        # TODO
+        '''
+        Get a single example.
+
+        Returns:
+            For train/dev: (encoder_input, decoder_target, nl_query)
+            For test: (encoder_input, nl_query)
+        '''
+        encoder_input = self.encoder_inputs[idx]
+
+        if self.split == 'test':
+            return encoder_input, self.nl_queries[idx]
+        else:
+            decoder_target = self.decoder_targets[idx]
+            return encoder_input, decoder_target, self.nl_queries[idx]
 
 def normal_collate_fn(batch):
     '''
-    Collation function to perform dynamic padding for training and evaluation with the
-    development or validation set.
+    Collation function for training and dev sets with dynamic padding.
 
-    Inputs:
-        * batch (List[Any]): batch is a list of length batch_size, where each index contains what
-                             the dataset __getitem__ function returns.
+    Args:
+        batch: List of tuples (encoder_input, decoder_target, nl_query)
 
-    Returns: To be compatible with the provided training loop, you should be returning
-        * encoder_ids: The input ids of shape BxT to be fed into the T5 encoder.
-        * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
-        * decoder_inputs: Decoder input ids of shape BxT' to be fed into T5 decoder.
-        * decoder_targets: The target tokens with which to train the decoder (the tokens following each decoder input)
-        * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
+    Returns:
+        encoder_ids: Padded encoder input ids [B, T]
+        encoder_mask: Attention mask for encoder [B, T]
+        decoder_inputs: Padded decoder input ids [B, T']
+        decoder_targets: Padded decoder target ids [B, T']
+        initial_decoder_inputs: Initial decoder token for generation [B, 1]
     '''
-    # TODO
-    return [], [], [], [], []
+    encoder_inputs = []
+    decoder_targets_list = []
+
+    # Unpack batch
+    for item in batch:
+        encoder_inputs.append(item[0])
+        decoder_targets_list.append(item[1])
+
+    # Pad encoder inputs
+    encoder_ids = torch.nn.utils.rnn.pad_sequence(
+        encoder_inputs, batch_first=True, padding_value=PAD_IDX
+    )
+
+    # Create encoder attention mask (1 for real tokens, 0 for padding)
+    encoder_mask = (encoder_ids != PAD_IDX).long()
+
+    # Pad decoder targets
+    decoder_targets = torch.nn.utils.rnn.pad_sequence(
+        decoder_targets_list, batch_first=True, padding_value=PAD_IDX
+    )
+
+    # Create decoder inputs by shifting targets right and prepending BOS token
+    # Use extra_id_0 as BOS token
+    bos_token_id = 32099  # <extra_id_0> token id
+    batch_size = decoder_targets.size(0)
+
+    # Decoder inputs = [BOS, target[:-1]]
+    bos_tokens = torch.full((batch_size, 1), bos_token_id, dtype=torch.long)
+    decoder_inputs = torch.cat([bos_tokens, decoder_targets[:, :-1]], dim=1)
+
+    # Initial decoder inputs for generation (just the BOS token)
+    initial_decoder_inputs = bos_tokens
+
+    return encoder_ids, encoder_mask, decoder_inputs, decoder_targets, initial_decoder_inputs
 
 def test_collate_fn(batch):
     '''
-    Collation function to perform dynamic padding for inference on the test set.
+    Collation function for test set with dynamic padding.
 
-    Inputs:
-        * batch (List[Any]): batch is a list of length batch_size, where each index contains what
-                             the dataset __getitem__ function returns.
+    Args:
+        batch: List of tuples (encoder_input, nl_query)
 
-    Recommended returns: 
-        * encoder_ids: The input ids of shape BxT to be fed into the T5 encoder.
-        * encoder_mask: Mask of shape BxT associated with padding tokens in the encoder input
-        * initial_decoder_inputs: The very first input token to be decoder (only to be used in evaluation)
+    Returns:
+        encoder_ids: Padded encoder input ids [B, T]
+        encoder_mask: Attention mask for encoder [B, T]
+        initial_decoder_inputs: Initial decoder token for generation [B, 1]
     '''
-    # TODO
-    return [], [], []
+    encoder_inputs = []
+
+    # Unpack batch
+    for item in batch:
+        encoder_inputs.append(item[0])
+
+    # Pad encoder inputs
+    encoder_ids = torch.nn.utils.rnn.pad_sequence(
+        encoder_inputs, batch_first=True, padding_value=PAD_IDX
+    )
+
+    # Create encoder attention mask
+    encoder_mask = (encoder_ids != PAD_IDX).long()
+
+    # Initial decoder inputs (BOS token)
+    bos_token_id = 32099  # <extra_id_0> token id
+    batch_size = encoder_ids.size(0)
+    initial_decoder_inputs = torch.full((batch_size, 1), bos_token_id, dtype=torch.long)
+
+    return encoder_ids, encoder_mask, initial_decoder_inputs
 
 def get_dataloader(batch_size, split):
     data_folder = 'data'
@@ -85,7 +184,7 @@ def load_t5_data(batch_size, test_batch_size):
     train_loader = get_dataloader(batch_size, "train")
     dev_loader = get_dataloader(test_batch_size, "dev")
     test_loader = get_dataloader(test_batch_size, "test")
-    
+
     return train_loader, dev_loader, test_loader
 
 
