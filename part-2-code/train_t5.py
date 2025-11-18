@@ -8,7 +8,7 @@ import numpy as np
 import wandb
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
-from transformers import GenerationConfig
+from transformers import GenerationConfig, T5TokenizerFast
 from load_data import load_t5_data
 from utils import compute_metrics, save_queries_and_records
 
@@ -23,7 +23,7 @@ def get_args():
 
     # Model hyperparameters
     parser.add_argument('--finetune', action='store_true', help="Whether to finetune T5 or not")
-    
+
     # Training hyperparameters
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
@@ -121,7 +121,7 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
         loss = criterion(logits[non_pad], decoder_targets[non_pad])
         loss.backward()
         optimizer.step()
-        if scheduler is not None: 
+        if scheduler is not None:
             scheduler.step()
 
         with torch.no_grad():
@@ -130,27 +130,115 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
             total_tokens += num_tokens
 
     return total_loss / total_tokens
-        
-def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_path, model_record_path):
-    '''
-    You must implement the evaluation loop to be using during training. We recommend keeping track
-    of the model loss on the SQL queries, the metrics compute_metrics returns (save_queries_and_records should be helpful)
-    and the model's syntax error rate. 
 
-    To compute non-loss metrics, you will need to perform generation with the model. Greedy decoding or beam search
-    should both provide good results. If you find that this component of evaluation takes too long with your compute,
-    we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
+def eval_epoch(args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_path, model_record_path):
     '''
-    # TODO
+    Evaluation loop for development set.
+
+    Computes:
+    - Cross-entropy loss on dev set
+    - Generates SQL queries using the model
+    - Computes metrics (F1, EM, error rate)
+
+    Returns:
+        eval_loss: Average cross-entropy loss
+        record_f1: F1 score for database records
+        record_em: Exact match for database records
+        sql_em: Exact match for SQL queries
+        error_rate: Fraction of queries with SQL execution errors
+    '''
     model.eval()
-    return 0, 0, 0, 0, 0
-        
+    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+
+    total_loss = 0
+    total_tokens = 0
+    criterion = nn.CrossEntropyLoss()
+
+    all_generated_queries = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, initial_decoder_inputs in tqdm(dev_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            decoder_input = decoder_input.to(DEVICE)
+            decoder_targets = decoder_targets.to(DEVICE)
+            initial_decoder_inputs = initial_decoder_inputs.to(DEVICE)
+
+            # Compute loss
+            logits = model(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                decoder_input_ids=decoder_input,
+            )['logits']
+
+            non_pad = decoder_targets != PAD_IDX
+            loss = criterion(logits[non_pad], decoder_targets[non_pad])
+
+            num_tokens = torch.sum(non_pad).item()
+            total_loss += loss.item() * num_tokens
+            total_tokens += num_tokens
+
+            # Generate SQL queries
+            # Using beam search for better quality
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                max_length=512,
+                num_beams=4,  # Beam search with 4 beams
+                early_stopping=True,
+            )
+
+            # Decode generated queries
+            batch_queries = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            all_generated_queries.extend(batch_queries)
+
+    # Calculate average loss
+    eval_loss = total_loss / total_tokens if total_tokens > 0 else 0
+
+    # Save generated queries and compute metrics
+    save_queries_and_records(all_generated_queries, model_sql_path, model_record_path)
+    sql_em, record_em, record_f1, error_msgs = compute_metrics(
+        gt_sql_path, model_sql_path, gt_record_path, model_record_path
+    )
+
+    # Calculate error rate
+    error_rate = len([msg for msg in error_msgs if msg is not None]) / len(error_msgs) if len(error_msgs) > 0 else 0
+
+    return eval_loss, record_f1, record_em, sql_em, error_rate
+
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
-    You must implement inference to compute your model's generated SQL queries and its associated 
-    database records. Implementation should be very similar to eval_epoch.
+    Inference on test set.
+
+    Generates SQL queries for test examples and saves them.
     '''
-    pass
+    model.eval()
+    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+
+    all_generated_queries = []
+
+    with torch.no_grad():
+        for encoder_input, encoder_mask, initial_decoder_inputs in tqdm(test_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+
+            # Generate SQL queries
+            generated_ids = model.generate(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                max_length=512,
+                num_beams=4,  # Beam search with 4 beams
+                early_stopping=True,
+            )
+
+            # Decode generated queries
+            batch_queries = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            all_generated_queries.extend(batch_queries)
+
+    # Save generated queries and records
+    save_queries_and_records(all_generated_queries, model_sql_path, model_record_path)
+    print(f"Generated {len(all_generated_queries)} test queries")
+    print(f"Saved to {model_sql_path} and {model_record_path}")
 
 def main():
     # Get key arguments
@@ -164,13 +252,13 @@ def main():
     model = initialize_model(args)
     optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
 
-    # Train 
+    # Train
     train(args, model, train_loader, dev_loader, optimizer, scheduler)
 
     # Evaluate
     model = load_model_from_checkpoint(args, best=True)
     model.eval()
-    
+
     # Dev set
     experiment_name = 'ft_experiment'
     model_type = 'ft' if args.finetune else 'scr'
