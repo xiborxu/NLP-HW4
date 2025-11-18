@@ -11,7 +11,12 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 def setup_wandb(args):
     # Implement this if you wish to use wandb in your experiments
-    pass
+    if args.use_wandb:
+        wandb.init(
+            project="hw4-part2-t5",
+            name=args.experiment_name,
+            config=vars(args)
+        )
 
 def initialize_model(args):
     '''
@@ -20,7 +25,19 @@ def initialize_model(args):
     or training a T5 model initialized with the 'google-t5/t5-small' config
     from scratch.
     '''
-    pass
+    if args.finetune:
+        # Load pretrained T5-small model for finetuning
+        print("Loading pretrained T5-small model for finetuning...")
+        model = T5ForConditionalGeneration.from_pretrained('google-t5/t5-small')
+    else:
+        # Train from scratch with T5-small config
+        print("Initializing T5-small model from scratch...")
+        config = T5Config.from_pretrained('google-t5/t5-small')
+        model = T5ForConditionalGeneration(config)
+
+    model = model.to(DEVICE)
+    print(f"Model moved to {DEVICE}")
+    return model
 
 def mkdir(dirpath):
     if not os.path.exists(dirpath):
@@ -31,11 +48,39 @@ def mkdir(dirpath):
 
 def save_model(checkpoint_dir, model, best):
     # Save model checkpoint to be able to load the model later
-    pass
+    mkdir(checkpoint_dir)
+
+    if best:
+        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        print(f"Saving best model to {checkpoint_path}")
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
+
+    # Save model state dict
+    torch.save({
+        'model_state_dict': model.state_dict(),
+    }, checkpoint_path)
 
 def load_model_from_checkpoint(args, best):
     # Load model from a checkpoint
-    pass
+    # First initialize the model
+    model = initialize_model(args)
+
+    # Determine checkpoint path
+    checkpoint_dir = args.checkpoint_dir
+    if best:
+        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
+
+    print(f"Loading model from {checkpoint_path}")
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    model = model.to(DEVICE)
+    return model
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):
     optimizer = initialize_optimizer(args, model)
@@ -68,7 +113,7 @@ def initialize_optimizer(args, model):
         pass
 
     return optimizer
-        
+
 def initialize_scheduler(args, optimizer, epoch_length):
     num_training_steps = epoch_length * args.max_n_epochs
     num_warmup_steps = epoch_length * args.num_warmup_epochs
@@ -93,4 +138,3 @@ def get_parameter_names(model, forbidden_layer_types):
     # Add model specific parameters (defined with nn.Parameter) since they are not in any child.
     result += list(model._parameters.keys())
     return result
-
