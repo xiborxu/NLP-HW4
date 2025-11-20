@@ -23,6 +23,12 @@ def get_args():
 
     # Model hyperparameters
     parser.add_argument('--finetune', action='store_true', help="Whether to finetune T5 or not")
+    parser.add_argument('--model_name', type=str, default='google-t5/t5-base',
+                        help="T5 model name (e.g., google-t5/t5-base)")
+    parser.add_argument('--max_len', type=int, default=256,
+                        help="Maximum sequence length for tokenization")
+    parser.add_argument('--num_beams', type=int, default=8,
+                        help="Number of beams for beam search during generation")
 
     # Training hyperparameters
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
@@ -68,6 +74,9 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
         tr_loss = train_epoch(args, model, train_loader, optimizer, scheduler)
         print(f"Epoch {epoch}: Average train loss was {tr_loss}")
 
+        # Clear GPU cache before evaluation to free memory
+        torch.cuda.empty_cache()
+
         eval_loss, record_f1, record_em, sql_em, error_rate = eval_epoch(args, model, dev_loader,
                                                                          gt_sql_path, model_sql_path,
                                                                          gt_record_path, model_record_path)
@@ -102,7 +111,7 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
     model.train()
     total_loss = 0
     total_tokens = 0
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(train_loader):
         optimizer.zero_grad()
@@ -148,11 +157,12 @@ def eval_epoch(args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_p
         error_rate: Fraction of queries with SQL execution errors
     '''
     model.eval()
-    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+    # Get tokenizer from dataset for consistency
+    tokenizer = dev_loader.dataset.tokenizer
 
     total_loss = 0
     total_tokens = 0
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     all_generated_queries = []
 
@@ -179,12 +189,12 @@ def eval_epoch(args, model, dev_loader, gt_sql_path, model_sql_path, gt_record_p
             total_tokens += num_tokens
 
             # Generate SQL queries
-            # Using beam search for better quality
+            # Using configurable beam search
             generated_ids = model.generate(
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
                 max_length=512,
-                num_beams=4,  # Beam search with 4 beams
+                num_beams=args.num_beams,
                 early_stopping=True,
             )
 
@@ -213,7 +223,8 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     Generates SQL queries for test examples and saves them.
     '''
     model.eval()
-    tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+    # Get tokenizer from dataset for consistency
+    tokenizer = test_loader.dataset.tokenizer
 
     all_generated_queries = []
 
@@ -227,7 +238,7 @@ def test_inference(args, model, test_loader, model_sql_path, model_record_path):
                 input_ids=encoder_input,
                 attention_mask=encoder_mask,
                 max_length=512,
-                num_beams=4,  # Beam search with 4 beams
+                num_beams=args.num_beams,
                 early_stopping=True,
             )
 
@@ -248,7 +259,10 @@ def main():
         setup_wandb(args)
 
     # Load the data and the model
-    train_loader, dev_loader, test_loader = load_t5_data(args.batch_size, args.test_batch_size)
+    train_loader, dev_loader, test_loader = load_t5_data(
+        args.batch_size, args.test_batch_size,
+        model_name=args.model_name, max_len=args.max_len
+    )
     model = initialize_model(args)
     optimizer, scheduler = initialize_optimizer_and_scheduler(args, model, len(train_loader))
 

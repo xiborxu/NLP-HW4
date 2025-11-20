@@ -21,22 +21,23 @@ def setup_wandb(args):
 def initialize_model(args):
     '''
     Helper function to initialize the model. You should be either finetuning
-    the pretrained model associated with the 'google-t5/t5-small' checkpoint
-    or training a T5 model initialized with the 'google-t5/t5-small' config
-    from scratch.
+    the pretrained model or training a T5 model from scratch.
     '''
+    # Use t5-base as default for better performance
+    model_name = getattr(args, 'model_name', 'google-t5/t5-base')
+
     if args.finetune:
-        # Load pretrained T5-small model for finetuning
-        print("Loading pretrained T5-small model for finetuning...")
-        model = T5ForConditionalGeneration.from_pretrained('google-t5/t5-small')
+        # Load the pre-trained model for fine-tuning
+        print(f"Loading pre-trained model for fine-tuning: {model_name}")
+        model = T5ForConditionalGeneration.from_pretrained(model_name)
     else:
-        # Train from scratch with T5-small config
-        print("Initializing T5-small model from scratch...")
-        config = T5Config.from_pretrained('google-t5/t5-small')
+        # Load the configuration and initialize a new model from scratch
+        print(f"Initializing model from scratch with config: {model_name}")
+        config = T5Config.from_pretrained(model_name)
         model = T5ForConditionalGeneration(config)
 
-    model = model.to(DEVICE)
-    print(f"Model moved to {DEVICE}")
+    # Move the model to the correct device
+    model.to(DEVICE)
     return model
 
 def mkdir(dirpath):
@@ -47,39 +48,44 @@ def mkdir(dirpath):
             pass
 
 def save_model(checkpoint_dir, model, best):
-    # Save model checkpoint to be able to load the model later
-    mkdir(checkpoint_dir)
-
+    '''
+    Save model checkpoint using HuggingFace's save_pretrained method.
+    '''
+    # Determine the save path based on whether it's the 'best' model
     if best:
-        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
-        print(f"Saving best model to {checkpoint_path}")
+        save_path = os.path.join(checkpoint_dir, 'best_model')
     else:
-        checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
+        # Save as a generic 'latest_checkpoint'
+        save_path = os.path.join(checkpoint_dir, 'latest_checkpoint')
 
-    # Save model state dict
-    torch.save({
-        'model_state_dict': model.state_dict(),
-    }, checkpoint_path)
+    # Create the directory if it doesn't exist
+    mkdir(save_path)
+
+    # Use Hugging Face's save_pretrained to save model and config
+    print(f"Saving model checkpoint to {save_path}")
+    model.save_pretrained(save_path)
 
 def load_model_from_checkpoint(args, best):
-    # Load model from a checkpoint
-    # First initialize the model
-    model = initialize_model(args)
-
-    # Determine checkpoint path
-    checkpoint_dir = args.checkpoint_dir
+    '''
+    Load model from a checkpoint using HuggingFace's from_pretrained method.
+    '''
+    # Determine the load path
     if best:
-        checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
+        load_path = os.path.join(args.checkpoint_dir, 'best_model')
     else:
-        checkpoint_path = os.path.join(checkpoint_dir, 'last_model.pt')
+        load_path = os.path.join(args.checkpoint_dir, 'latest_checkpoint')
 
-    print(f"Loading model from {checkpoint_path}")
+    # Check if the path exists
+    if not os.path.exists(load_path):
+        raise FileNotFoundError(f"Checkpoint directory not found at: {load_path}")
 
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load the model using Hugging Face's from_pretrained
+    print(f"Loading model checkpoint from {load_path}")
+    from transformers import T5ForConditionalGeneration
+    model = T5ForConditionalGeneration.from_pretrained(load_path)
 
-    model = model.to(DEVICE)
+    # Move the model to the correct device
+    model.to(DEVICE)
     return model
 
 def initialize_optimizer_and_scheduler(args, model, epoch_length):

@@ -15,16 +15,19 @@ PAD_IDX = 0
 
 class T5Dataset(Dataset):
 
-    def __init__(self, data_folder, split):
+    def __init__(self, data_folder, split, model_name='google-t5/t5-small', max_len=None):
         '''
         Initialize T5Dataset for text-to-SQL task.
 
         Args:
             data_folder: Path to the data directory
             split: One of 'train', 'dev', or 'test'
+            model_name: T5 model name for tokenizer
+            max_len: Maximum sequence length for tokenization
         '''
         self.split = split
-        self.tokenizer = T5TokenizerFast.from_pretrained('google-t5/t5-small')
+        self.max_len = max_len
+        self.tokenizer = T5TokenizerFast.from_pretrained(model_name)
 
         # Load and process data
         self.encoder_inputs, self.decoder_targets, self.nl_queries = self.process_data(
@@ -53,7 +56,11 @@ class T5Dataset(Dataset):
         for query in nl_queries:
             # T5 expects prefix for task - using "translate English to SQL: " prefix
             prefixed_query = f"translate English to SQL: {query}"
-            tokenized = tokenizer(prefixed_query, add_special_tokens=True, return_tensors='pt')
+            tokenize_kwargs = {'add_special_tokens': True, 'return_tensors': 'pt'}
+            if self.max_len:
+                tokenize_kwargs['max_length'] = self.max_len
+                tokenize_kwargs['truncation'] = True
+            tokenized = tokenizer(prefixed_query, **tokenize_kwargs)
             encoder_inputs.append(tokenized['input_ids'].squeeze(0))
 
         # Load and tokenize SQL queries (if not test set)
@@ -65,7 +72,11 @@ class T5Dataset(Dataset):
 
             decoder_targets = []
             for sql in sql_queries:
-                tokenized = tokenizer(sql, add_special_tokens=True, return_tensors='pt')
+                tokenize_kwargs = {'add_special_tokens': True, 'return_tensors': 'pt'}
+                if self.max_len:
+                    tokenize_kwargs['max_length'] = self.max_len
+                    tokenize_kwargs['truncation'] = True
+                tokenized = tokenizer(sql, **tokenize_kwargs)
                 decoder_targets.append(tokenized['input_ids'].squeeze(0))
 
         return encoder_inputs, decoder_targets, nl_queries
@@ -171,19 +182,19 @@ def test_collate_fn(batch):
 
     return encoder_ids, encoder_mask, initial_decoder_inputs
 
-def get_dataloader(batch_size, split):
+def get_dataloader(batch_size, split, model_name='google-t5/t5-small', max_len=None):
     data_folder = 'data'
-    dset = T5Dataset(data_folder, split)
+    dset = T5Dataset(data_folder, split, model_name=model_name, max_len=max_len)
     shuffle = split == "train"
     collate_fn = normal_collate_fn if split != "test" else test_collate_fn
 
     dataloader = DataLoader(dset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn)
     return dataloader
 
-def load_t5_data(batch_size, test_batch_size):
-    train_loader = get_dataloader(batch_size, "train")
-    dev_loader = get_dataloader(test_batch_size, "dev")
-    test_loader = get_dataloader(test_batch_size, "test")
+def load_t5_data(batch_size, test_batch_size, model_name='google-t5/t5-small', max_len=None):
+    train_loader = get_dataloader(batch_size, "train", model_name=model_name, max_len=max_len)
+    dev_loader = get_dataloader(test_batch_size, "dev", model_name=model_name, max_len=max_len)
+    test_loader = get_dataloader(test_batch_size, "test", model_name=model_name, max_len=max_len)
 
     return train_loader, dev_loader, test_loader
 
